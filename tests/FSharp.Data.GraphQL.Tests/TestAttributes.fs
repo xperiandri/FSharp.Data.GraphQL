@@ -28,6 +28,9 @@ module TraitType =
     [<Literal>]
     let Category = "Category"
 
+    [<Literal>]
+    let ObjectListFilterOperator = "ObjectListFilter operator"
+
 module TraitName =
 
     [<Literal>]

@@ -2,6 +2,7 @@ namespace FSharp.Data.GraphQL.Server.Middleware
 
 open System
 open System.Collections
+open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Linq
 open System.Linq.Expressions
@@ -10,60 +11,64 @@ open System.Runtime.InteropServices
 open FSharp.Data.GraphQL
 
 /// Contains tooling for working with ObjectListFilter.
-[<CompilationRepresentation (CompilationRepresentationFlags.ModuleSuffix)>]
+[<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
 module ObjectListFilter =
     /// Contains operators for building and comparing ObjectListFilter values.
     module Operators =
         /// Creates a new ObjectListFilter representing an AND operation between two existing ones.
-        let ( &&& ) x y = And (x, y)
+        let (&&&) x y = And (x, y)
 
         /// Creates a new ObjectListFilter representing an OR operation between two existing ones.
-        let ( ||| ) x y = Or (x, y)
+        let (|||) x y = Or (x, y)
 
         /// Creates a new ObjectListFilter representing an EQUALS operation between two comparable values.
-        let ( === ) fname value = Equals ({ FieldName = fname; Value = value }, null)
+        let (===) fname value = Equals ({ FieldName = fname; Value = value }, null)
 
         /// Creates a new ObjectListFilter representing a GREATER THAN operation of a comparable value.
-        let ( >>> ) fname value = GreaterThan { FieldName = fname; Value = value }
+        let (>>>) fname value = GreaterThan { FieldName = fname; Value = value }
 
         /// Creates a new ObjectListFilter representing a GREATER THAN OR EQUAL operation of a comparable value.
-        let ( ==> ) fname value = GreaterThanOrEqual { FieldName = fname; Value = value }
+        let (==>) fname value = GreaterThanOrEqual { FieldName = fname; Value = value }
 
         /// Creates a new ObjectListFilter representing a LESS THAN operation of a comparable value.
-        let ( <<< ) fname value = LessThan { FieldName = fname; Value = value }
+        let (<<<) fname value = LessThan { FieldName = fname; Value = value }
 
         /// Creates a new ObjectListFilter representing a LESS THAN OR EQUAL operation of a comparable value.
-        let ( <== ) fname value = LessThanOrEqual { FieldName = fname; Value = value }
+        let (<==) fname value = LessThanOrEqual { FieldName = fname; Value = value }
 
         /// Creates a new ObjectListFilter representing a STARTS WITH operation of a string value.
-        let ( =@@ ) fname value = StartsWith ({ FieldName = fname; Value = value }, null)
+        let (=@@) fname value = StartsWith ({ FieldName = fname; Value = value }, null)
 
         /// Creates a new ObjectListFilter representing an ENDS WITH operation of a string value.
-        let ( @@= ) fname value = EndsWith ({ FieldName = fname; Value = value }, null)
+        let (@@=) fname value = EndsWith ({ FieldName = fname; Value = value }, null)
 
         /// Creates a new ObjectListFilter representing a CONTAINS operation.
-        let ( @=@ ) fname value = Contains ({ FieldName = fname; Value = value }, null)
+        let (@=@) fname value = Contains ({ FieldName = fname; Value = value }, null)
 
         /// Creates a new ObjectListFilter representing a IN operation.
-        let ( =~= ) fname value = In { FieldName = fname; Value = value }
+        let (=~=) fname value = In { FieldName = fname; Value = value }
 
         /// Creates a new ObjectListFilter representing a field sub comparison.
-        let ( --> ) fname filter = FilterField { FieldName = fname; Value = filter }
+        let (-->) fname filter = FilterField { FieldName = fname; Value = filter }
 
         /// Creates a new ObjectListFilter representing a NOT operation for the existing one.
-        let ( !!! ) filter = Not filter
+        let (!!!) filter = Not filter
 
         /// Creates a new ObjectListFilter representing a case-insensitive EQUALS operation on a string value.
-        let ( ===~ ) fname (value : string) = Equals ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
+        let (===~) fname (value : string) =
+            Equals ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
 
         /// Creates a new ObjectListFilter representing a case-insensitive STARTS WITH operation on a string value.
-        let ( =@@~ ) fname (value : string) = StartsWith ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
+        let (=@@~) fname (value : string) =
+            StartsWith ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
 
         /// Creates a new ObjectListFilter representing a case-insensitive ENDS WITH operation on a string value.
-        let ( @@=~ ) fname (value : string) = EndsWith ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
+        let (@@=~) fname (value : string) =
+            EndsWith ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
 
         /// Creates a new ObjectListFilter representing a case-insensitive CONTAINS operation on a string value.
-        let ( @=@~ ) fname (value : string) = Contains ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
+        let (@=@~) fname (value : string) =
+            Contains ({ FieldName = fname; Value = value }, StringComparer.CurrentCultureIgnoreCase)
 
     let private genericWhereMethod =
         typeof<Queryable>.GetMethods ()
@@ -85,12 +90,54 @@ module ObjectListFilter =
     let private iEnumerableType = typeof<System.Collections.IEnumerable>
 
     let private stringComparisonType = typeof<StringComparison>
-    let private StringStartsWithMethod = stringType.GetMethod ("StartsWith", [| stringType; stringComparisonType |])
-    let private StringEndsWithMethod = stringType.GetMethod ("EndsWith", [| stringType; stringComparisonType |])
-    let private StringContainsMethod = stringType.GetMethod ("Contains", [| stringType; stringComparisonType |])
+    let private StringStartsWithMethod =
+        stringType.GetMethod ("StartsWith", [| stringType; stringComparisonType |])
+    let private StringEndsWithMethod =
+        stringType.GetMethod ("EndsWith", [| stringType; stringComparisonType |])
+    let private StringContainsMethod =
+        stringType.GetMethod ("Contains", [| stringType; stringComparisonType |])
     let private StringEqualsMethod = stringType.GetMethod ("Equals", [| stringType; stringComparisonType |])
     let private unwrapOptionMethod =
         FSharp.Data.GraphQL.Helpers.moduleType.GetMethod (nameof Helpers.unwrap)
+
+    /// Cache for MemberInfo (PropertyInfo or FieldInfo) lookups to avoid repeated reflection.
+    let private memberInfoCache = System.Collections.Concurrent.ConcurrentDictionary<(Type * string), MemberInfo voption> ()
+
+    /// Checks if a type is the generic IEnumerable<T> interface using structural comparison.
+    let private isGenericIEnumerable (t : Type) : bool =
+        t.IsGenericType && t.GetGenericTypeDefinition () = genericIEnumerableType
+
+    /// Gets MemberInfo (PropertyInfo or FieldInfo) from cache, performing reflection if not cached.
+    /// Mirrors the behavior of Expression.PropertyOrField which checks properties first, then fields.
+    let private getCachedMemberInfo (entityType : Type) (stripSuffix : string) : MemberInfo voption =
+        let key = (entityType, stripSuffix)
+        memberInfoCache.GetOrAdd(
+            key,
+            Func<(Type * string), MemberInfo voption> (fun _ ->
+                // Try property first (matches Expression.PropertyOrField behavior)
+                match
+                    entityType.GetProperty (
+                        stripSuffix,
+                        BindingFlags.Public
+                        ||| BindingFlags.Instance
+                        ||| BindingFlags.IgnoreCase
+                    )
+                with
+                | null ->
+                    // Fall back to field if property not found
+                    match
+                        entityType.GetField (
+                            stripSuffix,
+                            BindingFlags.Public
+                            ||| BindingFlags.Instance
+                            ||| BindingFlags.IgnoreCase
+                        )
+                    with
+                    | null -> ValueNone
+                    | f -> ValueSome (f :> MemberInfo)
+                | p -> ValueSome (p :> MemberInfo)
+            )
+        )
 
     let private getCollectionInstanceContainsMethod (memberType : Type) =
         memberType
@@ -153,14 +200,68 @@ module ObjectListFilter =
         match comparer with
         | null -> ValueNone
         | :? StringComparer as sc ->
-            if obj.ReferenceEquals (sc, StringComparer.OrdinalIgnoreCase) then ValueSome StringComparison.OrdinalIgnoreCase
-            elif obj.ReferenceEquals (sc, StringComparer.InvariantCultureIgnoreCase) then ValueSome StringComparison.InvariantCultureIgnoreCase
-            elif obj.ReferenceEquals (sc, StringComparer.CurrentCultureIgnoreCase) then ValueSome StringComparison.CurrentCultureIgnoreCase
-            elif obj.ReferenceEquals (sc, StringComparer.Ordinal) then ValueSome StringComparison.Ordinal
-            elif obj.ReferenceEquals (sc, StringComparer.InvariantCulture) then ValueSome StringComparison.InvariantCulture
-            elif obj.ReferenceEquals (sc, StringComparer.CurrentCulture) then ValueSome StringComparison.CurrentCulture
-            else ValueNone
+            if obj.ReferenceEquals (sc, StringComparer.OrdinalIgnoreCase) then
+                ValueSome StringComparison.OrdinalIgnoreCase
+            elif obj.ReferenceEquals (sc, StringComparer.InvariantCultureIgnoreCase) then
+                ValueSome StringComparison.InvariantCultureIgnoreCase
+            elif obj.ReferenceEquals (sc, StringComparer.CurrentCultureIgnoreCase) then
+                ValueSome StringComparison.CurrentCultureIgnoreCase
+            elif obj.ReferenceEquals (sc, StringComparer.Ordinal) then
+                ValueSome StringComparison.Ordinal
+            elif obj.ReferenceEquals (sc, StringComparer.InvariantCulture) then
+                ValueSome StringComparison.InvariantCulture
+            elif obj.ReferenceEquals (sc, StringComparer.CurrentCulture) then
+                ValueSome StringComparison.CurrentCulture
+            else
+                ValueNone
         | _ -> ValueNone
+
+     /// Gets the type from a MemberInfo (PropertyInfo or FieldInfo).
+    let private getMemberType (member' : MemberInfo) : Type =
+        match member' with
+        | :? PropertyInfo as p -> p.PropertyType
+        | :? FieldInfo as f -> f.FieldType
+        | _ -> invalidOp $"Unsupported member type: {member'.GetType().Name}"
+
+    /// Resolves the field type within a given entity, stripping suffixes and unwrapping options.
+    let private getFieldTypeForEntity (entityType : Type) (fieldName : string) : Type voption =
+        let stripSuffix = TypeCoercion.stripOperatorSuffix fieldName
+        match getCachedMemberInfo entityType stripSuffix with
+        | ValueNone -> ValueNone
+        | ValueSome member' -> ValueSome (TypeCoercion.unwrapOption (getMemberType member'))
+
+    /// Returns both the original member type and the unwrapped type.
+    /// Useful for detecting if we need to unwrap option expressions at runtime.
+    let private getFieldTypeAndOriginal (entityType : Type) (fieldName : string) : (Type * Type) voption =
+        let stripSuffix = TypeCoercion.stripOperatorSuffix fieldName
+        match getCachedMemberInfo entityType stripSuffix with
+        | ValueNone -> ValueNone
+        | ValueSome ``member`` ->
+            let originalType = getMemberType ``member``
+            let unwrappedType = TypeCoercion.unwrapOption originalType
+            ValueSome (originalType, unwrappedType)
+
+    /// Detects if a type is enumerable (but not string).
+    let private isEnumerableType (``type`` : Type) : bool =
+        not (Type.(=) (``type``, stringType))
+        && iEnumerableType.IsAssignableFrom (``type``)
+        && ``type``.GetInterfaces().Any (fun i -> isGenericIEnumerable i)
+
+    /// <summary>Unwraps the element type from an enumerable type.</summary>
+    let private tryGetEnumerableElementType (``type`` : Type) : Type voption = TypeCoercion.tryUnwrapEnumerableElement ``type``
+
+    /// <summary>Gets the closed generic <see cref="System.Linq.Enumerable.Any{T}"/> method for the given element type.</summary>
+    let private getEnumerableAnyMethod (elementType : Type) : MethodInfo =
+        match
+            enumerableType
+                .GetMethods(BindingFlags.Static ||| BindingFlags.Public)
+                .FirstOrDefault (fun m -> m.Name = "Any" && m.GetParameters().Length = 2)
+        with
+        | null ->
+            let message =
+                $"Static 'Any' method with 2 parameters not found on '{enumerableType.FullName}' class. Expected signature: Any<T>(IEnumerable<T>, Func<T,bool>). "
+            raise (MissingMemberException message)
+        | anyGenericStaticMethod -> anyGenericStaticMethod.MakeGenericMethod ([| elementType |])
 
     let rec buildFilterExpr isEnumerableQuery (param : SourceExpression) buildTypeDiscriminatorCheck filter : Expression =
 
@@ -173,20 +274,41 @@ module ObjectListFilter =
 
         let unsafeConvertTo ``type`` ``member`` = Expression.Convert (Expression.Convert (``member``, objectType), ``type``)
 
-        let normalizeStringMemberExpr (``member`` : MemberExpression) : Expression =
-            match ``member``.Type with
+        let normalizeStringMemberExpr (``member`` : Expression) : Expression =
+            let memberType = ``member``.Type
+            match memberType with
             | t when t = stringType -> ``member``
             | _ when not isEnumerableQuery -> unsafeConvertTo stringType ``member``
-            | _ when isEnumerableQuery -> Expression.Convert (Expression.Call (unwrapOptionMethod, ``member``), stringType)
+            | _ when isEnumerableQuery ->
+                // For ParameterExpression (from "_"), we can't call unwrapOptionMethod directly
+                if ``member`` :? ParameterExpression then
+                    Expression.Convert (``member``, stringType)
+                else
+                    match ``member`` with
+                    | :? MemberExpression as me -> Expression.Convert (Expression.Call (unwrapOptionMethod, me), stringType)
+                    | _ -> Expression.Convert (``member``, stringType)
             | _ -> Expression.Convert (``member``, stringType)
 
         match filter with
         | Not (Equals (f, comparer)) ->
-            let ``member`` = Expression.PropertyOrField (param, f.FieldName)
+            let ``member`` =
+                // Special case: "_" means the element itself, not a field property
+                if f.FieldName = "_" then
+                    param.Value
+                else
+                    Expression.PropertyOrField (param, f.FieldName)
             match comparerToStringComparison comparer with
             | ValueSome comparison ->
                 let value = Helpers.unwrap (box f.Value) :?> string
-                Expression.Not (Expression.Call (normalizeStringMemberExpr ``member``, StringEqualsMethod, Expression.Constant (value, stringType), Expression.Constant comparison)) :> Expression
+                Expression.Not (
+                    Expression.Call (
+                        normalizeStringMemberExpr ``member``,
+                        StringEqualsMethod,
+                        Expression.Constant (value, stringType),
+                        Expression.Constant comparison
+                    )
+                )
+                :> Expression
             | ValueNone ->
                 let hasEqualityOperator = hasEqualityOperator ``member``.Type
                 match f.Value with
@@ -203,11 +325,22 @@ module ObjectListFilter =
         | And (f1, f2) -> Expression.AndAlso (build f1, build f2)
         | Or (f1, f2) -> Expression.OrElse (build f1, build f2)
         | Equals (f, comparer) ->
-            let ``member`` = Expression.PropertyOrField (param, f.FieldName)
+            let ``member`` =
+                // Special case: "_" means the element itself, not a field property
+                if f.FieldName = "_" then
+                    param.Value
+                else
+                    Expression.PropertyOrField (param, f.FieldName)
             match comparerToStringComparison comparer with
             | ValueSome comparison ->
                 let value = Helpers.unwrap (box f.Value) :?> string
-                Expression.Call (normalizeStringMemberExpr ``member``, StringEqualsMethod, Expression.Constant (value, stringType), Expression.Constant comparison) :> Expression
+                Expression.Call (
+                    normalizeStringMemberExpr ``member``,
+                    StringEqualsMethod,
+                    Expression.Constant (value, stringType),
+                    Expression.Constant comparison
+                )
+                :> Expression
             | ValueNone ->
                 let hasEqualityOperator = hasEqualityOperator ``member``.Type
                 match f.Value with
@@ -246,11 +379,20 @@ module ObjectListFilter =
             | NonEnumerableCast ``type`` -> Expression.LessThanOrEqual ((unsafeConvertTo ``type`` ``member``), Expression.Constant f.Value)
         | StartsWith (f, comparer) ->
             let ``member`` = Expression.PropertyOrField (param, f.FieldName)
-            let comparison = comparerToStringComparison comparer |> ValueOption.defaultValue StringComparison.CurrentCulture
-            Expression.Call (normalizeStringMemberExpr ``member``, StringStartsWithMethod, Expression.Constant f.Value, Expression.Constant comparison)
+            let comparison =
+                comparerToStringComparison comparer
+                |> ValueOption.defaultValue StringComparison.CurrentCulture
+            Expression.Call (
+                normalizeStringMemberExpr ``member``,
+                StringStartsWithMethod,
+                Expression.Constant f.Value,
+                Expression.Constant comparison
+            )
         | EndsWith (f, comparer) ->
             let ``member`` = Expression.PropertyOrField (param, f.FieldName)
-            let comparison = comparerToStringComparison comparer |> ValueOption.defaultValue StringComparison.CurrentCulture
+            let comparison =
+                comparerToStringComparison comparer
+                |> ValueOption.defaultValue StringComparison.CurrentCulture
             Expression.Call (normalizeStringMemberExpr ``member``, StringEndsWithMethod, Expression.Constant f.Value, Expression.Constant comparison)
 
         | Contains (f, comparer) ->
@@ -258,7 +400,7 @@ module ObjectListFilter =
             let isEnumerable (memberType : Type) =
                 not (Type.(=) (memberType, stringType))
                 && iEnumerableType.IsAssignableFrom (memberType)
-                && memberType.GetInterfaces().Any (fun i -> i.FullName.StartsWith "System.Collections.Generic.IEnumerable`1")
+                && memberType.GetInterfaces().Any (fun i -> isGenericIEnumerable i)
             let normalizedValue = Values.normalizeOptional ``member``.Type f.Value
             let callContains memberType =
                 let itemType =
@@ -289,20 +431,89 @@ module ObjectListFilter =
             | :? FieldInfo as field when field.FieldType |> isEnumerable -> callContains field.FieldType
             | _ ->
                 let unwrappedValue = Helpers.unwrap f.Value
-                let comparison = comparerToStringComparison comparer |> ValueOption.defaultValue StringComparison.CurrentCulture
-                Expression.Call (normalizeStringMemberExpr ``member``, StringContainsMethod, Expression.Constant (unwrappedValue :?> string, stringType), Expression.Constant comparison)
+                let comparison =
+                    comparerToStringComparison comparer
+                    |> ValueOption.defaultValue StringComparison.CurrentCulture
+                Expression.Call (
+                    normalizeStringMemberExpr ``member``,
+                    StringContainsMethod,
+                    Expression.Constant (unwrappedValue :?> string, stringType),
+                    Expression.Constant comparison
+                )
         | In f when not (f.Value.IsEmpty) ->
-            let ``member`` = Expression.PropertyOrField (param, f.FieldName)
+            let ``member`` =
+                // Special case: "_" means the element itself, not a field property
+                if f.FieldName = "_" then
+                    param.Value
+                else
+                    Expression.PropertyOrField (param, f.FieldName)
+            // The list is already coerced to the correct element type by TypeCoercion.coerceFilter.
+            // We use objectType for the expression because providers like Cosmos cannot convert from
+            // obj list to IEnumerable<T> at runtime. The coerced values are already boxed correctly,
+            // so Enumerable.Contains<object> works universally.
             let enumerableContains = getEnumerableContainsMethod objectType
-            Expression.Call (enumerableContains, (Expression.Constant f.Value), Expression.Convert (``member``, objectType))
+            Expression.Call (enumerableContains, Expression.Constant f.Value, Expression.Convert (``member``, objectType))
         | In f -> Expression.Constant (false)
         | OfTypes types ->
             types
             |> Seq.map (fun t -> buildTypeDiscriminatorCheck param t)
             |> Seq.reduce (fun acc expr -> Expression.OrElse (acc, expr))
         | FilterField f ->
-            let paramExpr = Expression.PropertyOrField (param, f.FieldName)
-            buildFilterExpr isEnumerableQuery (SourceExpression paramExpr) buildTypeDiscriminatorCheck f.Value
+            let paramType = param.Value.Type
+            match getFieldTypeAndOriginal paramType f.FieldName with
+            | ValueNone ->
+                // Fallback: just recurse (may fail downstream)
+                let paramExpr = Expression.PropertyOrField (param, f.FieldName)
+                buildFilterExpr isEnumerableQuery (SourceExpression paramExpr) buildTypeDiscriminatorCheck f.Value
+            | ValueSome (originalFieldType, unwrappedFieldType) ->
+                // Check if the UNWRAPPED type is enumerable
+                let isCollection = isEnumerableType unwrappedFieldType
+
+                // Check if this is an option-wrapped collection
+                let isOptionWrapped = not (Type.(=) (originalFieldType, unwrappedFieldType))
+
+                if isCollection then
+                    let effectiveType = unwrappedFieldType
+                    match tryGetEnumerableElementType effectiveType with
+                    | ValueNone ->
+                        // Should not happen for isEnumerableType, but fallback to direct traversal
+                        let paramExpr = Expression.PropertyOrField (param, f.FieldName)
+                        buildFilterExpr isEnumerableQuery (SourceExpression paramExpr) buildTypeDiscriminatorCheck f.Value
+                    | ValueSome elementType ->
+                        // Create lambda parameter for element
+                        let elemParam = Expression.Parameter (elementType, "x")
+                        // Recursively build inner filter over element type
+                        let innerExpr = buildFilterExpr false (SourceExpression elemParam) buildTypeDiscriminatorCheck f.Value
+                        // Lambda: x => innerExpr
+                        let funcGenericDef = typeof<Func<_, bool>>.GetGenericTypeDefinition ()
+                        let lambdaType = funcGenericDef.MakeGenericType ([| elementType; typeof<bool> |])
+                        let lambda = Expression.Lambda (lambdaType, innerExpr, elemParam) :> Expression
+
+                        let rawCollExpr = Expression.PropertyOrField (param, f.FieldName)
+
+                        if isOptionWrapped then
+                            // Option-wrapped collection: e.g., some_field : option<list<T>>
+                            // Strategy: Access the wrapped collection via .Value and pass it to Any<T> with the predicate.
+                            // If the option is None, accessing .Value throws NullReferenceException.
+                            // We wrap the entire Any call in try-catch to safely return false for None,
+                            // effectively treating None collections as "no match".
+                            let anyMethod = getEnumerableAnyMethod elementType
+                            let valueExpr = Expression.PropertyOrField (rawCollExpr, "Value")
+                            let anyCall = Expression.Call (anyMethod, valueExpr, lambda)
+
+                            // Wrap in try-catch: try { Any(opt.Value, pred) } catch (NullReferenceException) { false }
+                            let catchBlock = Expression.Catch (typeof<NullReferenceException>, Expression.Constant (false))
+                            let tryExpr = Expression.TryCatch (anyCall, catchBlock)
+                            tryExpr :> Expression
+                        else
+                            // Direct collection (not wrapped in option): pass directly to Enumerable.Any
+                            let anyMethod = getEnumerableAnyMethod elementType
+                            Expression.Call (anyMethod, rawCollExpr, lambda)
+                else
+                    // Not a collection, treat as scalar
+                    let paramExpr = Expression.PropertyOrField (param, f.FieldName)
+                    buildFilterExpr isEnumerableQuery (SourceExpression paramExpr) buildTypeDiscriminatorCheck f.Value
+
 
     type private CompareDiscriminatorExpressionVisitor<'T, 'D>
         (compareDiscriminator : CompareDiscriminatorExpression<'T, 'D>, param : SourceExpression, value : obj) =
@@ -363,9 +574,9 @@ module ObjectListFilterExtensions =
     type ObjectListFilter with
 
         /// <summary>
-        /// Applies the filter to a queryable with automatic type coercion of JSON primitives to CLR types.
-        /// Supports <see cref="Guid"/>, <see cref="DateTime"/>, <see cref="DateTimeOffset"/>, <see cref="DateOnly"/>, and F# discriminated unions.
-        /// Pass <see cref="JsonSerializerOptions"/> via <c>ObjectListFilterLinqOptions</c> constructor for custom serialization.
+        /// Applies the filter to a queryable with automatic type coercion of JSON primitives to CLR types. Supports <see cref="Guid"/>,
+        /// <see cref="DateTime"/>, <see cref="DateTimeOffset"/>, <see cref="DateOnly"/>, and F# discriminated unions. Pass
+        /// <see cref="JsonSerializerOptions"/> via <c>ObjectListFilterLinqOptions</c> constructor for custom serialization.
         /// </summary>
         /// <example>
         /// <code>
@@ -380,7 +591,10 @@ module ObjectListFilterExtensions =
         /// </code>
         /// </example>
         member inline filter.ApplyTo<'T, 'D> (query : IQueryable<'T>, [<Optional>] options : ObjectListFilterLinqOptions<'T, 'D> | null) =
-            let options = options |> ValueOption.ofObj |> ValueOption.defaultValue ObjectListFilterLinqOptions<'T, 'D>.None
+            let options =
+                options
+                |> ValueOption.ofObj
+                |> ValueOption.defaultValue ObjectListFilterLinqOptions<'T, 'D>.None
             let filter = TypeCoercion.coerceFilter options.JsonOptions typeof<'T> filter
             apply options filter query
 

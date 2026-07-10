@@ -1,4 +1,4 @@
-[<Xunit.TraitAttribute (Tests.TraitType.Category, Tests.TraitName.ObjectListFilter)>]
+[<Xunit.Trait (Tests.TraitType.Category, Tests.TraitName.ObjectListFilter)>]
 module FSharp.Data.GraphQL.Tests.ObjectListFilter.TypeCoercion.Common
 
 open System

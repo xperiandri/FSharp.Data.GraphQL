@@ -1,4 +1,4 @@
-[<Xunit.TraitAttribute (Tests.TraitType.Category, Tests.TraitName.ObjectListFilter)>]
+[<Xunit.Trait (Tests.TraitType.Category, Tests.TraitName.ObjectListFilter)>]
 module FSharp.Data.GraphQL.Tests.ObjectListFilter.TypeCoercion.FilterTests
 
 open Xunit
@@ -125,45 +125,6 @@ let ``coerceFilter coerces int through voption wrapper for Equals`` () =
     let result = applyFilter filter
     result |> List.length |> equals 1
     (List.head result).Name |> equals "Charlie"
-
-// ──────────────────────────────────────────────────────────────────────────────
-// In operator
-// ──────────────────────────────────────────────────────────────────────────────
-
-[<Fact>]
-let ``coerceFilter coerces In operator values to CLR enum`` () =
-    let filter = In { FieldName = "color"; Value = [ box "Red"; box "Blue" ] }
-    let result = applyFilter filter
-    result |> List.length |> equals 2
-    result |> List.map (fun e -> e.Name) |> List.sort |> equals [ "Alice"; "Charlie" ]
-
-[<Fact>]
-let ``coerceFilter coerces In operator values to DU-as-enum`` () =
-    let filter = In { FieldName = "status"; Value = [ box "Active"; box "Pending" ] }
-    let result = applyFilter filter
-    result |> List.length |> equals 2
-    result |> List.map (fun e -> e.Name) |> List.sort |> equals [ "Alice"; "Charlie" ]
-
-[<Fact>]
-let ``coerceFilter coerces In operator values to Guid`` () =
-    let filter =
-        In {
-            FieldName = "guidField"
-            Value = [
-                box "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-                box "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-            ]
-        }
-    let result = applyFilter filter
-    result |> List.length |> equals 2
-    result |> List.map (fun e -> e.Name) |> List.sort |> equals [ "Alice"; "Bob" ]
-
-[<Fact>]
-let ``coerceFilter coerces In operator values to single-case DU wrapping int`` () =
-    let filter = In { FieldName = "wrappedScore"; Value = [ box 10; box 30 ] }
-    let result = applyFilter filter
-    result |> List.length |> equals 2
-    result |> List.map (fun e -> e.Name) |> List.sort |> equals [ "Alice"; "Charlie" ]
 
 // ──────────────────────────────────────────────────────────────────────────────
 // string operators
