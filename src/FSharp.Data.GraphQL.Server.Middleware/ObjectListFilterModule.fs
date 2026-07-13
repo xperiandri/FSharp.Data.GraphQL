@@ -263,6 +263,25 @@ module ObjectListFilter =
             raise (MissingMemberException message)
         | anyGenericStaticMethod -> anyGenericStaticMethod.MakeGenericMethod ([| elementType |])
 
+    let private normalizeInValue (fieldType : Type) (value : obj) : obj =
+        let normalized = Values.normalizeOptional fieldType value
+        if obj.ReferenceEquals (normalized, null) then
+            null
+        elif fieldType.IsGenericType && fieldType.GetGenericTypeDefinition () = typedefof<Nullable<_>> then
+            let underlyingType = Nullable.GetUnderlyingType fieldType
+            if not (obj.ReferenceEquals (underlyingType, null)) && normalized.GetType () = underlyingType then
+                Activator.CreateInstance (fieldType, normalized)
+            else
+                normalized
+        else
+            normalized
+
+    let private materializeTypedInArray (fieldType : Type) (values : obj list) : Array =
+        let array = Array.CreateInstance (fieldType, values.Length)
+        values
+        |> List.iteri (fun index value -> array.SetValue (normalizeInValue fieldType value, index))
+        array
+
     let rec buildFilterExpr isEnumerableQuery (param : SourceExpression) buildTypeDiscriminatorCheck filter : Expression =
 
         let build = buildFilterExpr isEnumerableQuery param buildTypeDiscriminatorCheck
@@ -447,12 +466,10 @@ module ObjectListFilter =
                     param.Value
                 else
                     Expression.PropertyOrField (param, f.FieldName)
-            // The list is already coerced to the correct element type by TypeCoercion.coerceFilter.
-            // We use objectType for the expression because providers like Cosmos cannot convert from
-            // obj list to IEnumerable<T> at runtime. The coerced values are already boxed correctly,
-            // so Enumerable.Contains<object> works universally.
-            let enumerableContains = getEnumerableContainsMethod objectType
-            Expression.Call (enumerableContains, Expression.Constant f.Value, Expression.Convert (``member``, objectType))
+            let fieldType = ``member``.Type
+            let typedValues = materializeTypedInArray fieldType f.Value
+            let enumerableContains = getEnumerableContainsMethod fieldType
+            Expression.Call (enumerableContains, Expression.Constant typedValues, ``member``)
         | In f -> Expression.Constant (false)
         | OfTypes types ->
             types
