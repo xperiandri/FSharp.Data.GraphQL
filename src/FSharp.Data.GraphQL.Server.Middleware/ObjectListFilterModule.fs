@@ -195,25 +195,36 @@ module ObjectListFilter =
         |> Seq.head
 
     /// Maps an IComparer to a StringComparison value.
-    /// Returns ValueNone for null or Ordinal comparers (use default Expression.Equal path).
-    let private comparerToStringComparison (comparer : IComparer) =
+    /// Returns ValueNone for null or unsupported comparers.
+    let internal comparerToStringComparison (comparer : IComparer) =
         match comparer with
         | null -> ValueNone
         | :? StringComparer as sc ->
-            if obj.ReferenceEquals (sc, StringComparer.OrdinalIgnoreCase) then
-                ValueSome StringComparison.OrdinalIgnoreCase
-            elif obj.ReferenceEquals (sc, StringComparer.InvariantCultureIgnoreCase) then
-                ValueSome StringComparison.InvariantCultureIgnoreCase
-            elif obj.ReferenceEquals (sc, StringComparer.CurrentCultureIgnoreCase) then
-                ValueSome StringComparison.CurrentCultureIgnoreCase
-            elif obj.ReferenceEquals (sc, StringComparer.Ordinal) then
-                ValueSome StringComparison.Ordinal
-            elif obj.ReferenceEquals (sc, StringComparer.InvariantCulture) then
-                ValueSome StringComparison.InvariantCulture
-            elif obj.ReferenceEquals (sc, StringComparer.CurrentCulture) then
-                ValueSome StringComparison.CurrentCulture
+            let mutable isOrdinalIgnoreCase = false
+
+            if StringComparer.IsWellKnownOrdinalComparer (sc, &isOrdinalIgnoreCase) then
+                if isOrdinalIgnoreCase then
+                    ValueSome StringComparison.OrdinalIgnoreCase
+                else
+                    ValueSome StringComparison.Ordinal
             else
-                ValueNone
+                let mutable compareInfo = Unchecked.defaultof<Globalization.CompareInfo>
+                let mutable compareOptions = Globalization.CompareOptions.None
+
+                if StringComparer.IsWellKnownCultureAwareComparer (sc, &compareInfo, &compareOptions) then
+                    let isCurrentCulture = compareInfo.Equals Globalization.CultureInfo.CurrentCulture.CompareInfo
+                    let isInvariantCulture = compareInfo.Equals Globalization.CultureInfo.InvariantCulture.CompareInfo
+
+                    match compareOptions with
+                    | Globalization.CompareOptions.None when isCurrentCulture -> ValueSome StringComparison.CurrentCulture
+                    | Globalization.CompareOptions.IgnoreCase when isCurrentCulture ->
+                        ValueSome StringComparison.CurrentCultureIgnoreCase
+                    | Globalization.CompareOptions.None when isInvariantCulture -> ValueSome StringComparison.InvariantCulture
+                    | Globalization.CompareOptions.IgnoreCase when isInvariantCulture ->
+                        ValueSome StringComparison.InvariantCultureIgnoreCase
+                    | _ -> ValueNone
+                else
+                    ValueNone
         | _ -> ValueNone
 
      /// Gets the type from a MemberInfo (PropertyInfo or FieldInfo).

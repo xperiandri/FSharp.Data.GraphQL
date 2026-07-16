@@ -77,6 +77,7 @@
     <Compile Include="SelectLinqTests.fs" />
     <Compile Include="ObjectListFilter\ObjectListFilterLinqTests.fs" />
     <Compile Include="ObjectListFilter\ObjectListFilterLinqGenerateTests.fs" />
+    <Compile Include="ObjectListFilter\ObjectListFilterComparerMappingTests.fs" />
     <Compile Include="ObjectListFilter\TypeCoercionTests.Common.fs" />
     <Compile Include="ObjectListFilter\TypeCoercionValueTests.fs" />
     <Compile Include="ObjectListFilter\TypeCoercionFilterTests.fs" />
