@@ -212,16 +212,16 @@ module ObjectListFilter =
                 let mutable compareOptions = Globalization.CompareOptions.None
 
                 if StringComparer.IsWellKnownCultureAwareComparer (sc, &compareInfo, &compareOptions) then
-                    let isCurrentCulture = compareInfo.Equals Globalization.CultureInfo.CurrentCulture.CompareInfo
                     let isInvariantCulture = compareInfo.Equals Globalization.CultureInfo.InvariantCulture.CompareInfo
+                    let isCurrentCulture = compareInfo.Equals Globalization.CultureInfo.CurrentCulture.CompareInfo
 
                     match compareOptions with
-                    | Globalization.CompareOptions.None when isCurrentCulture -> ValueSome StringComparison.CurrentCulture
-                    | Globalization.CompareOptions.IgnoreCase when isCurrentCulture ->
-                        ValueSome StringComparison.CurrentCultureIgnoreCase
                     | Globalization.CompareOptions.None when isInvariantCulture -> ValueSome StringComparison.InvariantCulture
                     | Globalization.CompareOptions.IgnoreCase when isInvariantCulture ->
                         ValueSome StringComparison.InvariantCultureIgnoreCase
+                    | Globalization.CompareOptions.None when isCurrentCulture -> ValueSome StringComparison.CurrentCulture
+                    | Globalization.CompareOptions.IgnoreCase when isCurrentCulture ->
+                        ValueSome StringComparison.CurrentCultureIgnoreCase
                     | _ -> ValueNone
                 else
                     ValueNone
