@@ -14,14 +14,21 @@ open FSharp.Data.GraphQL.Server.Middleware
 
 [<Fact>]
 let ``comparerToStringComparison maps well-known StringComparer instances`` () =
+    let currentCultureIsInvariant =
+        obj.ReferenceEquals (StringComparer.CurrentCulture, StringComparer.InvariantCulture)
+
     let testCases =
         [
-            (StringComparer.OrdinalIgnoreCase :> IComparer, StringComparison.OrdinalIgnoreCase)
-            (StringComparer.InvariantCultureIgnoreCase :> IComparer, StringComparison.InvariantCultureIgnoreCase)
-            (StringComparer.CurrentCultureIgnoreCase :> IComparer, StringComparison.CurrentCultureIgnoreCase)
-            (StringComparer.Ordinal :> IComparer, StringComparison.Ordinal)
-            (StringComparer.InvariantCulture :> IComparer, StringComparison.InvariantCulture)
-            (StringComparer.CurrentCulture :> IComparer, StringComparison.CurrentCulture)
+            yield (StringComparer.OrdinalIgnoreCase :> IComparer, StringComparison.OrdinalIgnoreCase)
+            yield (StringComparer.InvariantCultureIgnoreCase :> IComparer, StringComparison.InvariantCultureIgnoreCase)
+            yield (StringComparer.Ordinal :> IComparer, StringComparison.Ordinal)
+            yield (StringComparer.InvariantCulture :> IComparer, StringComparison.InvariantCulture)
+            // On environments where CurrentCulture == InvariantCulture (e.g. Ubuntu CI with no locale),
+            // StringComparer.Current* singletons ARE the same objects as StringComparer.Invariant*,
+            // so they can only map to Invariant* values. Skip those cases in such environments.
+            if not currentCultureIsInvariant then
+                yield (StringComparer.CurrentCultureIgnoreCase :> IComparer, StringComparison.CurrentCultureIgnoreCase)
+                yield (StringComparer.CurrentCulture :> IComparer, StringComparison.CurrentCulture)
         ]
 
     for comparer, expected in testCases do
@@ -34,14 +41,21 @@ let ``comparerToStringComparison maps well-known StringComparer instances`` () =
 
 [<Fact>]
 let ``comparerToStringComparison singleton mappings are all distinct`` () =
+    let currentCultureIsInvariant =
+        obj.ReferenceEquals (StringComparer.CurrentCulture, StringComparer.InvariantCulture)
+
+    // On environments where CurrentCulture == InvariantCulture, Current* singletons are
+    // the same objects as Invariant* ones, so distinctness can only be checked for the
+    // remaining four singletons.
     let singletons : IComparer list =
         [
-            StringComparer.OrdinalIgnoreCase
-            StringComparer.InvariantCultureIgnoreCase
-            StringComparer.CurrentCultureIgnoreCase
-            StringComparer.Ordinal
-            StringComparer.InvariantCulture
-            StringComparer.CurrentCulture
+            yield StringComparer.OrdinalIgnoreCase
+            yield StringComparer.InvariantCultureIgnoreCase
+            yield StringComparer.Ordinal
+            yield StringComparer.InvariantCulture
+            if not currentCultureIsInvariant then
+                yield StringComparer.CurrentCultureIgnoreCase
+                yield StringComparer.CurrentCulture
         ]
 
     let results =
@@ -53,9 +67,9 @@ let ``comparerToStringComparison singleton mappings are all distinct`` () =
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IsWellKnownCultureAwareComparer fallback path
-// StringComparer.Create produces a non-singleton comparer that is still
-// well-known, so it falls through the ReferenceEquals branch and hits the
-// IsWellKnownCultureAwareComparer fallback.
+// StringComparer.Create produces a non-singleton comparer; the singleton
+// ReferenceEquals fast path is skipped and IsWellKnownCultureAwareComparer
+// is used instead.
 // ─────────────────────────────────────────────────────────────────────────────
 
 [<Fact>]
@@ -75,17 +89,30 @@ let ``comparerToStringComparison maps non-singleton InvariantCultureIgnoreCase c
 
 [<Fact>]
 let ``comparerToStringComparison maps non-singleton CurrentCulture comparer`` () =
+    // When CurrentCulture == InvariantCulture (e.g. Ubuntu CI), a non-singleton comparer
+    // created from CurrentCulture is indistinguishable from InvariantCulture and will
+    // legitimately map to InvariantCulture.
     let comparer = StringComparer.Create (CultureInfo.CurrentCulture, false) :> IComparer
     Assert.False (obj.ReferenceEquals (comparer, StringComparer.CurrentCulture :> obj))
     let result = ObjectListFilter.comparerToStringComparison comparer |> wantValueSome
-    result |> equals StringComparison.CurrentCulture
+    let currentCultureIsInvariant =
+        CultureInfo.CurrentCulture.CompareInfo.Equals CultureInfo.InvariantCulture.CompareInfo
+    let expected =
+        if currentCultureIsInvariant then StringComparison.InvariantCulture
+        else StringComparison.CurrentCulture
+    result |> equals expected
 
 [<Fact>]
 let ``comparerToStringComparison maps non-singleton CurrentCultureIgnoreCase comparer`` () =
     let comparer = StringComparer.Create (CultureInfo.CurrentCulture, true) :> IComparer
     Assert.False (obj.ReferenceEquals (comparer, StringComparer.CurrentCultureIgnoreCase :> obj))
     let result = ObjectListFilter.comparerToStringComparison comparer |> wantValueSome
-    result |> equals StringComparison.CurrentCultureIgnoreCase
+    let currentCultureIsInvariant =
+        CultureInfo.CurrentCulture.CompareInfo.Equals CultureInfo.InvariantCulture.CompareInfo
+    let expected =
+        if currentCultureIsInvariant then StringComparison.InvariantCultureIgnoreCase
+        else StringComparison.CurrentCultureIgnoreCase
+    result |> equals expected
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unknown / unsupported cases → ValueNone
@@ -122,14 +149,18 @@ let ``comparerToStringComparison returns ValueNone for non-standard culture comp
 
 [<Fact>]
 let ``comparerToStringComparison is deterministic for singletons`` () =
+    let currentCultureIsInvariant =
+        obj.ReferenceEquals (StringComparer.CurrentCulture, StringComparer.InvariantCulture)
+
     let singletons : IComparer list =
         [
-            StringComparer.OrdinalIgnoreCase
-            StringComparer.InvariantCultureIgnoreCase
-            StringComparer.CurrentCultureIgnoreCase
-            StringComparer.Ordinal
-            StringComparer.InvariantCulture
-            StringComparer.CurrentCulture
+            yield StringComparer.OrdinalIgnoreCase
+            yield StringComparer.InvariantCultureIgnoreCase
+            yield StringComparer.Ordinal
+            yield StringComparer.InvariantCulture
+            if not currentCultureIsInvariant then
+                yield StringComparer.CurrentCultureIgnoreCase
+                yield StringComparer.CurrentCulture
         ]
 
     for comparer in singletons do
