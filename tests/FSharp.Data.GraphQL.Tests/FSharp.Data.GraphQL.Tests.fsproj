@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>$(DotNetVersion)</TargetFramework>
@@ -105,6 +105,7 @@
     <Compile Include="AspNetCore/WebSocketConnectionTests.fs" />
     <Compile Include="TaskSeqFieldTests.fs" />
     <Compile Include="ValidationCacheTests.fs" />
+    <Compile Include="ReviewSharedSchemaTests.fs" />
     <Compile Include="AssemblyInfo.fs" />
   </ItemGroup>
 
