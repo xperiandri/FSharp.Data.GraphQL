@@ -379,3 +379,76 @@ let ``GET whose extensions do not ask for a persisted query is still answered wi
     Assert.Equal (0, recorder.OperationCalls.Count)
     assertOkResponse outcome
 }
+
+// ---- Review experiments (not committed) ----
+
+type private NonSeekableStream (inner : Stream) =
+    inherit Stream ()
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException ())
+    override _.Position with get () = raise (NotSupportedException ()) and set _ = raise (NotSupportedException ())
+    override _.Flush () = ()
+    override _.Read (buffer, offset, count) = inner.Read (buffer, offset, count)
+    override _.Seek (_, _) = raise (NotSupportedException ())
+    override _.SetLength _ = raise (NotSupportedException ())
+    override _.Write (_, _, _) = raise (NotSupportedException ())
+
+let private setNonSeekableJsonBody (json : string) (request : HttpRequest) =
+    request.ContentType <- "application/json"
+    let bytes = Encoding.UTF8.GetBytes json
+    request.Body <- new NonSeekableStream (new MemoryStream (bytes))
+
+[<Fact>]
+let ``XP non seekable ordinary POST executes`` () : Task = task {
+    let query = "query { hero(id: \"1000\") { id name } }"
+    let struct (handler, recorder, ctx, scope) =
+        createHandlerFor<RecordingHandler> (fun request ->
+            request.Method <- HttpMethods.Post
+            setNonSeekableJsonBody (requestBody query) request)
+    use _ = scope
+    let! outcome = handler.HandleAsync ()
+    let! struct (status, body) = executeOutcome ctx outcome
+    Assert.True ((recorder.OperationCalls.Count = 1), $"calls {recorder.OperationCalls.Count}; status {status}; body {body}")
+}
+
+[<Fact>]
+let ``XP non seekable APQ POST rejected`` () : Task = task {
+    let body = $"""{{"operationName":"%s{persistedQueryName}","variables":{{}},"extensions":%s{persistedQueryExtensions}}}"""
+    let struct (handler, recorder, ctx, scope) =
+        createHandlerFor<RecordingHandler> (fun request ->
+            request.Method <- HttpMethods.Post
+            setNonSeekableJsonBody body request)
+    use _ = scope
+    let! outcome = handler.HandleAsync ()
+    do! assertPersistedQueryNotSupported recorder ctx outcome
+}
+
+[<Theory>]
+[<InlineData("null")>]
+[<InlineData("\"text\"")>]
+[<InlineData("[]")>]
+[<InlineData("{\"extensions\":{\"tracing\":true}}")>]
+[<InlineData("{\"query\":\"{ hero(id: \\\"1000\\\") { name } }\",\"extensions\":{\"persistedQuery\":{}}}")>]
+[<InlineData("{\"query\":\"{ hero(id: \\\"1000\\\") { name } }\",\"extensions\":{\"persistedQuery\":1e400}}")>]
+let ``XP report outcome`` (json : string) : Task = task {
+    let struct (handler, recorder, ctx, scope) =
+        createHandlerFor<RecordingHandler> (fun request ->
+            request.Method <- HttpMethods.Post
+            setJsonBody json request)
+    use _ = scope
+    let! outcome =
+        task {
+            try
+                let! o = handler.HandleAsync ()
+                return Choice1Of2 o
+            with ex -> return Choice2Of2 ex
+        }
+    match outcome with
+    | Choice2Of2 ex -> fail $"REPORT {json} -> exception {ex}"
+    | Choice1Of2 outcome ->
+        let isOk = match outcome with Ok _ -> "Ok" | Error _ -> "Error"
+        let! struct (status, body) = executeOutcome ctx outcome
+        fail $"REPORT {json} -> {isOk} status {status} ops {recorder.OperationCalls.Count} intro {recorder.IntrospectionCalls.Count} cache '{ctx.Response.Headers.CacheControl}' body {body}"
+}
