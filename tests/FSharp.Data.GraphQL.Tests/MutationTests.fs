@@ -366,3 +366,51 @@ let ``Execute resolves query root fields concurrently`` () : Task = task {
 //      empty errors
 //      data |> equals (upcast expected)
 //    | response -> fail $"Expected a 'Direct' GQLResponse but got\n{response}"
+
+let private runDuplicateIfAttack (query : string) : Task = task {
+    let ast = parse query
+    let validation = Validation.Ast.validateDocument (resolutionOrderSchema :> ISchema).Introspected ast
+    let log = ResolutionLog ()
+    let execution = Executor(resolutionOrderSchema).AsyncExecute (ast, getMockInputContext, log) |> Async.StartImmediateAsTask
+    do! log.Release "first"
+    let! result = execution
+    let subscription =
+        match result with
+        | Deferred (_, _, deferred) -> deferred.Subscribe (fun _ -> ())
+        | other -> fail $"SEC: expected a Deferred result (validation: %A{validation}), got %A{other}"; null
+    // Both fields of the deferred root fragment start before either is released: they run concurrently
+    do! log.WaitStarted "second"
+    do! log.WaitStarted "third"
+    let eventsWhileHeld = log.Events
+    do! log.Release "second"
+    do! log.Release "third"
+    subscription.Dispose ()
+    Assert.Fail $"SEC BYPASS: validation=%A{validation}; events while second and third were both held: %A{eventsWhileHeld}"
+}
+
+[<Fact>]
+let ``SEC duplicate if on root inline fragment bypasses the mutation defer rule`` () : Task =
+    runDuplicateIfAttack """mutation {
+      first: taskBased(name: "first") { name }
+      ... @defer(if: true, if: false) {
+        second: taskBased(name: "second") { name }
+        third: taskBased(name: "third") { name }
+      }
+    }"""
+
+[<Fact>]
+let ``SEC duplicate if on root fragment spread bypasses the mutation defer rule`` () : Task =
+    runDuplicateIfAttack """mutation {
+      first: taskBased(name: "first") { name }
+      ...Withdrawals @defer(if: true, if: false)
+    }
+    fragment Withdrawals on Mutation {
+      second: taskBased(name: "second") { name }
+      third: taskBased(name: "third") { name }
+    }"""
+
+[<Fact>]
+let ``SEC duplicate if on root field is rejected`` () =
+    let ast = parse """mutation { first: taskBased(name: "first") @defer(if: true, if: false) { name } }"""
+    let validation = Validation.Ast.validateDocument (resolutionOrderSchema :> ISchema).Introspected ast
+    Assert.Fail $"SEC field control: %A{validation}"
