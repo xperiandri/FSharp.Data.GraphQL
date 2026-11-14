@@ -1634,30 +1634,25 @@ module Ast =
 
     /// <summary>
     /// The <c>@defer</c> and <c>@stream</c> directives applied to the root fields of the selection set, through the
-    /// fragments spread at its root, and to the fragments at its root themselves, which have an empty path.
+    /// fragments spread at its root.
     /// </summary>
     let rec private rootIncrementalDirectiveUsages
         (fragmentDefinitions : FragmentDefinition list)
         (visitedFragments : string list)
         (selectionSet : Selection list)
         : (FieldPath * Directive) list =
-        let usagesOf (directives : Directive list) (path : FieldPath) =
-            directives
-            |> List.filter isIncrementalDirective
-            |> List.map (fun directive -> path, directive)
         selectionSet
         |> List.collect (function
-            | Field field -> usagesOf field.Directives [ box field.AliasOrName ]
-            | InlineFragment fragment ->
-                usagesOf fragment.Directives []
-                @ rootIncrementalDirectiveUsages fragmentDefinitions visitedFragments fragment.SelectionSet
+            | Field field ->
+                field.Directives
+                |> List.filter isIncrementalDirective
+                |> List.map (fun directive -> [ box field.AliasOrName ], directive)
+            | InlineFragment fragment -> rootIncrementalDirectiveUsages fragmentDefinitions visitedFragments fragment.SelectionSet
             | FragmentSpread spread when not (visitedFragments |> List.contains spread.Name) ->
                 match fragmentDefinitions |> List.tryFind (fun fragment -> fragment.Name = ValueSome spread.Name) with
-                | Some fragment ->
-                    usagesOf spread.Directives []
-                    @ rootIncrementalDirectiveUsages fragmentDefinitions (spread.Name :: visitedFragments) fragment.SelectionSet
-                | None -> usagesOf spread.Directives []
-            | FragmentSpread spread -> usagesOf spread.Directives [])
+                | Some fragment -> rootIncrementalDirectiveUsages fragmentDefinitions (spread.Name :: visitedFragments) fragment.SelectionSet
+                | None -> []
+            | FragmentSpread _ -> [])
 
     /// <summary>
     /// The <c>@stream</c> directive may only be applied to list fields
@@ -1700,9 +1695,7 @@ module Ast =
             | _ -> Success)
 
     /// <summary>
-    /// <c>@defer</c> and <c>@stream</c> cannot be applied to the root fields of a mutation, which are executed serially,
-    /// nor to the fragments selecting them, whose fields would otherwise be executed after the rest of the mutation and
-    /// concurrently
+    /// <c>@defer</c> and <c>@stream</c> cannot be applied to the root fields of a mutation, which are executed serially
     /// (<see href="https://github.com/graphql/graphql-spec/pull/1110">Defer And Stream Directives Are Used On Valid Root Field</see>).
     /// </summary>
     let internal validateDeferStreamDirectivesOnRootFields (ctx : ValidationContext) =
@@ -1717,18 +1710,10 @@ module Ast =
                 rootIncrementalDirectiveUsages fragmentDefinitions [] def.SelectionSet
                 |> List.filter (fun (_, directive) -> not (isDisabledIncrementalDirective directive))
                 |> ValidationResult.collect (fun (path, directive) ->
-                    match path with
-                    // Only a fragment at the root has no path of its own
-                    | [] ->
-                        AstError.AsResult (
-                            $"Directive '%s{directive.Name}' cannot be applied to a fragment selecting root fields of the mutation type '%s{mutationTypeName}'.",
-                            path
-                        )
-                    | _ ->
-                        AstError.AsResult (
-                            $"Directive '%s{directive.Name}' cannot be applied to a root field of the mutation type '%s{mutationTypeName}'.",
-                            path
-                        ))
+                    AstError.AsResult (
+                        $"Directive '%s{directive.Name}' cannot be applied to a root field of the mutation type '%s{mutationTypeName}'.",
+                        path
+                    ))
             | _ -> Success)
 
     /// <summary>
