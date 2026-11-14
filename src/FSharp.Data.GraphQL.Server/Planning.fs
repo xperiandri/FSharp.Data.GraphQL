@@ -306,13 +306,11 @@ let private plannedSelectionKeyComparer =
             let struct (yField, yReturnDef, yInclude) = y
             obj.ReferenceEquals (xField, yField)
             && obj.ReferenceEquals (xReturnDef, yReturnDef)
-            && obj.ReferenceEquals (xInclude, yInclude)
         member _.GetHashCode key =
             let struct (field, returnDef, includer) = key
             HashCode.Combine (
                 LanguagePrimitives.PhysicalHash field,
-                LanguagePrimitives.PhysicalHash returnDef,
-                LanguagePrimitives.PhysicalHash includer
+                LanguagePrimitives.PhysicalHash returnDef
             ) }
 
 /// Compares the directives of a selection and the includer of its parent by reference
