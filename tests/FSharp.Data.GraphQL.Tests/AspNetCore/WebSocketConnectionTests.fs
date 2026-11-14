@@ -471,3 +471,223 @@ let ``The connection ends when its control loop stops while the reader waits for
     do! session.Run
     session.Socket.ServerCloseStatus |> equals (ValueSome (enum<WebSocketCloseStatus> 4429))
 }
+
+// ---- Review experiments (not part of the PR) ----
+
+type private RealSession = {
+    Server : WebSocket
+    Client : WebSocket
+    RealRun : Task
+    RealScope : IDisposable
+    Tcp : IDisposable list
+}
+
+let private startReal (configure : GraphQLOptions<Root> -> GraphQLOptions<Root>) : Task<RealSession> = task {
+    let listener = new Net.Sockets.TcpListener (Net.IPAddress.Loopback, 0)
+    listener.Start ()
+    let port = (listener.LocalEndpoint :?> Net.IPEndPoint).Port
+    let client = new Net.Sockets.TcpClient ()
+    let acceptTask = listener.AcceptTcpClientAsync ()
+    do! client.ConnectAsync (Net.IPAddress.Loopback, port)
+    let! server = acceptTask
+    listener.Stop ()
+    let serverSocket =
+        WebSocket.CreateFromStream (server.GetStream (), WebSocketCreationOptions (IsServer = true, SubProtocol = GraphQLTransportWS.SubProtocol, KeepAliveInterval = TimeSpan.Zero))
+    let clientSocket =
+        WebSocket.CreateFromStream (client.GetStream (), WebSocketCreationOptions (IsServer = false, SubProtocol = GraphQLTransportWS.SubProtocol, KeepAliveInterval = TimeSpan.Zero))
+    let services = ServiceCollection ()
+    services.AddLogging () |> ignore
+    services.AddGraphQL<Root> (TestSchema.executor, (fun _ -> { RequestId = "test" })) |> ignore
+    let scope = services.BuildServiceProvider().CreateScope()
+    let serviceProvider = scope.ServiceProvider
+    let httpContext = DefaultHttpContext (RequestServices = serviceProvider)
+    serviceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext <- httpContext
+    let options = serviceProvider.GetRequiredService<IOptions<GraphQLOptions<Root>>>().Value |> configure
+    let connection = GraphQLWebSocketConnection<Root> (httpContext, serverSocket, options, serviceProvider, NullLogger.Instance, CancellationToken.None)
+    return { Server = serverSocket; Client = clientSocket; RealRun = connection.RunAsync (); RealScope = scope; Tcp = [ client :> IDisposable; server :> IDisposable ] }
+}
+
+let private clientSend (s : RealSession) (text : string) : Task =
+    s.Client.SendAsync (ArraySegment (Encoding.UTF8.GetBytes text), WebSocketMessageType.Text, true, CancellationToken.None)
+
+let private clientReceive (s : RealSession) : Task<struct (WebSocketReceiveResult * string)> = task {
+    let buffer = Array.zeroCreate<byte> 65536
+    use cts = new CancellationTokenSource (timeout)
+    let! r = s.Client.ReceiveAsync (ArraySegment buffer, cts.Token)
+    return struct (r, Encoding.UTF8.GetString (buffer, 0, r.Count))
+}
+
+let private realInit (s : RealSession) : Task = task {
+    do! clientSend s """{"type":"connection_init"}"""
+    let! struct (_, text) = clientReceive s
+    Assert.Contains ("connection_ack", text)
+}
+
+[<Theory>]
+[<InlineData(65536)>]
+[<InlineData(67108864)>]
+let ``REVIEW real socket over limit closes with 1009 gracefully`` (size : int) : Task = task {
+    let! s = startReal (withSizeLimit smallSizeLimit)
+    use _ = s.RealScope
+    do! realInit s
+    let sw = Diagnostics.Stopwatch.StartNew ()
+    let rcv = clientReceive s
+    let sendTask = clientSend s (paddedMessage "ping" size)
+    let! struct (r, text) = rcv
+    Assert.True ((r.MessageType = WebSocketMessageType.Close), $"Expected close, got %A{r.MessageType} %s{text}")
+    r.CloseStatus |> equals (Nullable WebSocketCloseStatus.MessageTooBig)
+    try do! sendTask with ex -> printfn "send failed: %s" ex.Message
+    try do! s.Client.CloseOutputAsync (WebSocketCloseStatus.NormalClosure, "", CancellationToken.None) with ex -> printfn "close output failed: %s" ex.Message
+    do! waitForTask timeout "server did not end" s.RealRun
+    do! s.RealRun
+    let elapsed = sw.Elapsed
+    Assert.True (elapsed < TimeSpan.FromSeconds 4.0, $"took %A{elapsed}; server state %A{s.Server.State}")
+    s.Server.State |> equals WebSocketState.Closed
+    for d in s.Tcp do d.Dispose ()
+}
+
+[<Fact>]
+let ``REVIEW real socket invalid json closes with 4400 gracefully`` () : Task = task {
+    let! s = startReal id
+    use _ = s.RealScope
+    do! realInit s
+    let sw = Diagnostics.Stopwatch.StartNew ()
+    let rcv = clientReceive s
+    do! clientSend s "{ not json"
+    let! struct (r, text) = rcv
+    Assert.True ((r.MessageType = WebSocketMessageType.Close), $"Expected close, got %A{r.MessageType} %s{text}")
+    r.CloseStatus |> equals (Nullable (enum<WebSocketCloseStatus> 4400))
+    do! s.Client.CloseOutputAsync (WebSocketCloseStatus.NormalClosure, "", CancellationToken.None)
+    do! waitForTask timeout "server did not end" s.RealRun
+    do! s.RealRun
+    Assert.True (sw.Elapsed < TimeSpan.FromSeconds 4.0, $"took %A{sw.Elapsed}; server state %A{s.Server.State}")
+    s.Server.State |> equals WebSocketState.Closed
+    for d in s.Tcp do d.Dispose ()
+}
+
+[<Fact>]
+let ``REVIEW real socket connection_init over limit closes with 1009`` () : Task = task {
+    let! s = startReal (withSizeLimit smallSizeLimit)
+    use _ = s.RealScope
+    let rcv = clientReceive s
+    let sendTask = clientSend s (paddedMessage "connection_init" (1024 * 1024))
+    let! struct (r, text) = rcv
+    Assert.True ((r.MessageType = WebSocketMessageType.Close), $"Expected close, got %A{r.MessageType} %s{text}")
+    r.CloseStatus |> equals (Nullable WebSocketCloseStatus.MessageTooBig)
+    try do! sendTask with ex -> printfn "send failed: %s" ex.Message
+    try do! s.Client.CloseOutputAsync (WebSocketCloseStatus.NormalClosure, "", CancellationToken.None) with ex -> printfn "close output failed: %s" ex.Message
+    do! waitForTask timeout "server did not end" s.RealRun
+    do! s.RealRun
+    for d in s.Tcp do d.Dispose ()
+}
+
+[<Fact>]
+let ``REVIEW real socket backpressure then client close`` () : Task = task {
+    let struct (gate, handler) = gatedPingHandler ()
+    let! s = startReal (withPingHandler handler)
+    use _ = s.RealScope
+    do! realInit s
+    for _ in 1..40 do
+        do! clientSend s """{"type":"ping"}"""
+    do! Task.Delay 200
+    gate.SetResult ()
+    let mutable pongs = 0
+    while pongs < 40 do
+        let! struct (r, text) = clientReceive s
+        Assert.Contains ("pong", text)
+        pongs <- pongs + 1
+    do! s.Client.CloseOutputAsync (WebSocketCloseStatus.NormalClosure, "", CancellationToken.None)
+    do! waitForTask timeout "server did not end" s.RealRun
+    do! s.RealRun
+    for d in s.Tcp do d.Dispose ()
+}
+
+type private CountingStream (inner : IO.Stream) =
+    inherit IO.Stream ()
+    let mutable read = 0L
+    member _.BytesRead = Interlocked.Read &read
+    override _.CanRead = inner.CanRead
+    override _.CanWrite = inner.CanWrite
+    override _.CanSeek = false
+    override _.Length = raise (NotSupportedException ())
+    override _.Position with get () = raise (NotSupportedException ()) and set _ = raise (NotSupportedException ())
+    override _.Flush () = inner.Flush ()
+    override _.FlushAsync (ct : CancellationToken) = inner.FlushAsync ct
+    override _.Seek (_, _) = raise (NotSupportedException ())
+    override _.SetLength _ = raise (NotSupportedException ())
+    override _.Read (buffer : byte[], offset : int, count : int) =
+        let n = inner.Read (buffer, offset, count)
+        Interlocked.Add (&read, int64 n) |> ignore
+        n
+    override _.ReadAsync (buffer : byte[], offset : int, count : int, ct : CancellationToken) : Task<int> = task {
+        let! n = inner.ReadAsync (buffer, offset, count, ct)
+        Interlocked.Add (&read, int64 n) |> ignore
+        return n
+    }
+    override _.ReadAsync (buffer : Memory<byte>, ct : CancellationToken) : ValueTask<int> =
+        let t = task {
+            let! n = inner.ReadAsync (buffer, ct)
+            Interlocked.Add (&read, int64 n) |> ignore
+            return n
+        }
+        ValueTask<int> t
+    override _.Write (buffer : byte[], offset : int, count : int) = inner.Write (buffer, offset, count)
+    override _.WriteAsync (buffer : byte[], offset : int, count : int, ct : CancellationToken) = inner.WriteAsync (buffer, offset, count, ct)
+    override _.WriteAsync (buffer : ReadOnlyMemory<byte>, ct : CancellationToken) = inner.WriteAsync (buffer, ct)
+    override _.Dispose (disposing : bool) = if disposing then inner.Dispose ()
+
+[<Theory>]
+[<InlineData(67108864)>]
+[<InlineData(1073741824)>]
+let ``REVIEW2 bytes the server reads of an oversized message`` (size : int) : Task = task {
+    let listener = new Net.Sockets.TcpListener (Net.IPAddress.Loopback, 0)
+    listener.Start ()
+    let port = (listener.LocalEndpoint :?> Net.IPEndPoint).Port
+    let client = new Net.Sockets.TcpClient ()
+    let acceptTask = listener.AcceptTcpClientAsync ()
+    do! client.ConnectAsync (Net.IPAddress.Loopback, port)
+    let! server = acceptTask
+    listener.Stop ()
+    let counting = new CountingStream (server.GetStream ())
+    let serverSocket =
+        WebSocket.CreateFromStream (counting, WebSocketCreationOptions (IsServer = true, SubProtocol = GraphQLTransportWS.SubProtocol, KeepAliveInterval = TimeSpan.Zero))
+    let clientSocket =
+        WebSocket.CreateFromStream (client.GetStream (), WebSocketCreationOptions (IsServer = false, SubProtocol = GraphQLTransportWS.SubProtocol, KeepAliveInterval = TimeSpan.Zero))
+    let services = ServiceCollection ()
+    services.AddLogging () |> ignore
+    services.AddGraphQL<Root> (TestSchema.executor, (fun _ -> { RequestId = "test" })) |> ignore
+    use scope = services.BuildServiceProvider().CreateScope()
+    let serviceProvider = scope.ServiceProvider
+    let httpContext = DefaultHttpContext (RequestServices = serviceProvider)
+    serviceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext <- httpContext
+    let options = serviceProvider.GetRequiredService<IOptions<GraphQLOptions<Root>>>().Value
+    let connection = GraphQLWebSocketConnection<Root> (httpContext, serverSocket, options, serviceProvider, NullLogger.Instance, CancellationToken.None)
+    let run = connection.RunAsync ()
+    do! clientSocket.SendAsync (ArraySegment (Encoding.UTF8.GetBytes """{"type":"connection_init"}"""), WebSocketMessageType.Text, true, CancellationToken.None)
+    let buffer = Array.zeroCreate<byte> 65536
+    let! _ = clientSocket.ReceiveAsync (ArraySegment buffer, CancellationToken.None)
+    let readBefore = counting.BytesRead
+    let rcv = clientSocket.ReceiveAsync (ArraySegment buffer, CancellationToken.None)
+    let payload = Encoding.UTF8.GetBytes (paddedMessage "ping" size)
+    let sw = Diagnostics.Stopwatch.StartNew ()
+    // Sent in 1 MiB fragments so that the client stops sending once the connection is gone
+    let sendTask = task {
+        try
+            let mutable offset = 0
+            while offset < payload.Length do
+                let n = min (1024 * 1024) (payload.Length - offset)
+                do! clientSocket.SendAsync (ArraySegment (payload, offset, n), WebSocketMessageType.Text, (offset + n = payload.Length), CancellationToken.None)
+                offset <- offset + n
+        with ex -> printfn "client send ended: %s" ex.Message
+    }
+    let! r = rcv
+    let closeSeenAt = sw.Elapsed
+    let readAtClose = counting.BytesRead - readBefore
+    let! _ = Task.WhenAny (run, Task.Delay (TimeSpan.FromSeconds 15.0))
+    let runEndedAt = sw.Elapsed
+    let readTotal = counting.BytesRead - readBefore
+    client.Dispose ()
+    server.Dispose ()
+    let! _ = Task.WhenAny (sendTask, Task.Delay 2000)
+    fail $"REPORT size=%d{size} closeStatus=%A{r.CloseStatus} closeSeenAt=%A{closeSeenAt} readWhenCloseSeen=%d{readAtClose} runCompleted=%b{run.IsCompleted} runEndedAt=%A{runEndedAt} serverReadTotal=%d{readTotal} serverState=%A{serverSocket.State}"
+}
