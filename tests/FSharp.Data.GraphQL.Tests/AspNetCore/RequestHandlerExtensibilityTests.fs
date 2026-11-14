@@ -379,3 +379,98 @@ let ``GET whose extensions do not ask for a persisted query is still answered wi
     Assert.Equal (0, recorder.OperationCalls.Count)
     assertOkResponse outcome
 }
+
+
+// ===== SECURITY REVIEW EXPERIMENTS (not to be committed) =====
+let private expLog (line : string) =
+    File.AppendAllText (@"C:\Users\Andrii\AppData\Local\Temp\claude\C--Users-Andrii-Dev-GitHub-FSharp-Data-GraphQL\c613e8cc-031e-45a9-9e2a-2c4f399f6427\scratchpad\pr11\review-security\exp.log", line + Environment.NewLine)
+
+[<Fact>]
+let ``EXP GET with many invalid extensions values cost`` () : Task = task {
+    // as many `extensions=[` pairs as fit in a 16 KB path (HTTP/2 header field limit)
+    let count = 16384 / 13
+    let raw = "?" + String.Join ("&", Seq.replicate count "extensions=[")
+    let run (rawQuery : string) (n : int) = task {
+        let sw = Diagnostics.Stopwatch ()
+        for _ in 1..n do
+            let struct (handler, _, _, scope) =
+                createHandlerFor<RecordingHandler> (fun request ->
+                    request.Method <- HttpMethods.Get
+                    request.QueryString <- QueryString rawQuery)
+            use _ = scope
+            sw.Start ()
+            let! r = handler.CheckOperationType ()
+            sw.Stop ()
+            ignore r
+        return sw.Elapsed.TotalMilliseconds / float n
+    }
+    let runFull (rawQuery : string) (n : int) = task {
+        let sw = Diagnostics.Stopwatch ()
+        for _ in 1..n do
+            let struct (handler, _, ctx, scope) =
+                createHandlerFor<DefaultGraphQLRequestHandler<Root>> (fun request ->
+                    request.Method <- HttpMethods.Get
+                    request.QueryString <- QueryString rawQuery)
+            use _ = scope
+            use body = new MemoryStream ()
+            ctx.Response.Body <- body
+            sw.Start ()
+            let! r = handler.HandleAsync ()
+            let res = match r with Ok x | Error x -> x
+            do! res.ExecuteAsync ctx
+            sw.Stop ()
+        return sw.Elapsed.TotalMilliseconds / float n
+    }
+    let! _ = run raw 20
+    let! _ = run "" 20
+    let! _ = runFull "" 20
+    let! _ = runFull raw 20
+    let! withParams = run raw 200
+    let! without = run "" 200
+    let! fullWithout = runFull "" 200
+    let! fullWith = runFull raw 200
+    expLog $"GET check: %d{count} invalid extensions values: %.3f{withParams} ms; no params: %.3f{without} ms; full introspection GET without: %.3f{fullWithout} ms; full with params: %.3f{fullWith} ms; raw length %d{raw.Length}"
+}
+
+[<Fact>]
+let ``EXP GET with percent encoded surrogate in extensions`` () : Task = task {
+    let struct (handler, _, ctx, scope) =
+        createHandlerFor<RecordingHandler> (fun request ->
+            request.Method <- HttpMethods.Get
+            request.QueryString <- QueryString "?extensions=%22%ED%A0%80%22")
+    use _ = scope
+    let v = ctx.Request.Query["extensions"].ToString ()
+    expLog $"Decoded value: %s{v} length %d{v.Length} chars %A{v.ToCharArray () |> Array.map int}"
+    try
+        let! r = handler.CheckOperationType ()
+        expLog $"surrogate result: %A{r}"
+    with ex -> expLog $"surrogate exception: %s{ex.GetType().FullName}: %s{ex.Message}"
+}
+
+[<Fact>]
+let ``EXP POST edge cases`` () : Task = task {
+    let q = JsonSerializer.Serialize "query { hero(id: \"1000\") { id } }"
+    let cases = [
+        "upper-key", $"""{{"query":%s{q},"Extensions":{{"persistedQuery":{{}}}}}}"""
+        "escaped-key", $"""{{"query":%s{q},"ext\u0065nsions":{{"persisted\u0051uery":{{}}}}}}"""
+        "dup-ext-last-null", $"""{{"query":%s{q},"extensions":{{"persistedQuery":{{}}}},"extensions":null}}"""
+        "dup-pq-last-null", $"""{{"query":%s{q},"extensions":{{"persistedQuery":{{}},"persistedQuery":null}}}}"""
+        "dup-pq-first-null", $"""{{"query":%s{q},"extensions":{{"persistedQuery":null,"persistedQuery":{{}}}}}}"""
+        "neg-zero", $"""{{"query":%s{q},"extensions":{{"persistedQuery":-0}}}}"""
+        "huge-num", $"""{{"query":%s{q},"extensions":{{"persistedQuery":1e400}}}}"""
+        "tiny-num", $"""{{"query":%s{q},"extensions":{{"persistedQuery":1e-400}}}}"""
+        "ext-string", $"""{{"query":%s{q},"extensions":"{{\"persistedQuery\":{{}}}}"}}"""
+    ]
+    for (name, body) in cases do
+        let struct (handler, recorder, _, scope) =
+            createHandlerFor<RecordingHandler> (fun request ->
+                request.Method <- HttpMethods.Post
+                setJsonBody body request)
+        use _ = scope
+        try
+            let! r = handler.HandleAsync ()
+            let kind = match r with Ok x -> $"Ok %s{x.GetType().Name}" | Error x -> $"Error %s{x.GetType().Name}"
+            expLog $"%s{name}: %s{kind} ops=%d{recorder.OperationCalls.Count} intro=%d{recorder.IntrospectionCalls.Count}"
+        with ex -> expLog $"%s{name}: EXCEPTION %s{ex.GetType().FullName}: %s{ex.Message}"
+}
+
