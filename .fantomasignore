@@ -1,4 +1,0 @@
-# Ignore AssemblyInfo files
-AssemblyInfo.fs
-# Legacy Xamarin sample that is not part of any solution
-samples/star-wars-fabulous-client/
