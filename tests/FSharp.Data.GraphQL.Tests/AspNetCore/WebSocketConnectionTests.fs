@@ -38,6 +38,11 @@ type private FakeWebSocket () =
     // Written by the server's reader, read by the test
     let mutable deliveredBytes = 0L
     let mutable deliveredMessages = 0
+    let mutable sendGate : Task = Task.CompletedTask
+    let mutable sentCount = 0
+
+    member _.SendGate with get () = sendGate and set v = sendGate <- v
+    member _.SentCount = Volatile.Read &sentCount
 
     member _.EnqueueText (json : string) = incoming.Writer.TryWrite (ValueSome (Encoding.UTF8.GetBytes json)) |> ignore
     member _.EnqueueClose () = incoming.Writer.TryWrite ValueNone |> ignore
@@ -98,7 +103,8 @@ type private FakeWebSocket () =
 
     override _.SendAsync (buffer : ArraySegment<byte>, _ : WebSocketMessageType, _ : bool, _ : CancellationToken) : Task =
         sent.Writer.TryWrite (Encoding.UTF8.GetString (buffer.Array, buffer.Offset, buffer.Count)) |> ignore
-        Task.CompletedTask
+        Interlocked.Increment &sentCount |> ignore
+        sendGate
 
 type private Session = {
     Socket : FakeWebSocket
@@ -470,4 +476,63 @@ let ``The connection ends when its control loop stops while the reader waits for
     do! waitForTask timeout "The connection did not end after its control loop stopped while the reader was waiting for room in the inbox" session.Run
     do! session.Run
     session.Socket.ServerCloseStatus |> equals (ValueSome (enum<WebSocketCloseStatus> 4429))
+}
+
+[<Fact>]
+let ``REVIEW a client that never reads makes the server read and retain every ping`` () : Task = task {
+    let session = start ()
+    use _ = session.Scope
+    do! initialize session
+    // From now on the client never reads: every send blocks, as on a TCP connection whose receive window is full
+    let never = TaskCompletionSource ()
+    session.Socket.SendGate <- never.Task
+    let count = 200
+    let items = 256 * 1024 / 3
+    let payload = String.Join (",", Seq.replicate items "[]")
+    let ping = $$"""{"type":"ping","payload":[{{payload}}]}"""
+    printfn "ping size %d bytes" (Encoding.UTF8.GetByteCount ping)
+    GC.Collect (); GC.WaitForPendingFinalizers (); GC.Collect ()
+    let before = GC.GetTotalMemory true
+    for _ in 1..count do
+        session.Socket.EnqueueText ping
+    do!
+        (fun () -> session.Socket.DeliveredMessages >= count + 1)
+        |> waitUntil (fun () -> $"read only %d{session.Socket.DeliveredMessages}")
+    do! Task.Delay 500
+    let after = GC.GetTotalMemory true
+    printfn "delivered %d messages, sent %d frames, retained %d MiB" session.Socket.DeliveredMessages session.Socket.SentCount ((after - before) / 1048576L)
+    Assert.True (session.Socket.DeliveredMessages <= 1 + 1 + WebSocketConnectionLimits.IncomingMessageQueueCapacity + 1,
+                  $"The server read %d{session.Socket.DeliveredMessages} messages from a client that never reads; retained %d{(after - before) / 1048576L} MiB")
+}
+[<Fact>]
+let ``REVIEW a full inbox with default options retains far more than 18 times the size limit`` () : Task = task {
+    let struct (gate, handler) = gatedPingHandler ()
+    let session = startConnection (withPingHandler handler)
+    use _ = session.Scope
+    do! initialize session
+    let limit = session.Options.WebsocketOptions.MaxReceiveMessageSize
+    let items = (limit - 64) / 3
+    let payload = String.Join (",", Seq.replicate items "[]")
+    let ping = $$"""{"type":"ping","payload":[{{payload}}]}"""
+    let size = Encoding.UTF8.GetByteCount ping
+    printfn "ping size %d bytes, limit %d" size limit
+    Assert.True (size <= limit, "ping must be within the limit")
+    GC.Collect (); GC.WaitForPendingFinalizers (); GC.Collect ()
+    let before = GC.GetTotalMemory true
+    let count = 30
+    for _ in 1..count do
+        session.Socket.EnqueueText ping
+    let readerWaiting = 1 + 1 + WebSocketConnectionLimits.IncomingMessageQueueCapacity + 1
+    let sw = Diagnostics.Stopwatch.StartNew ()
+    while session.Socket.DeliveredMessages < readerWaiting && sw.Elapsed < TimeSpan.FromMinutes 3.0 do
+        do! Task.Delay 100
+    printfn "reached %d after %O" session.Socket.DeliveredMessages sw.Elapsed
+    do! Task.Delay 3000
+    let after = GC.GetTotalMemory true
+    // The fake socket still holds the undelivered client messages; subtract them
+    let undelivered = int64 (count + 1 - session.Socket.DeliveredMessages) * int64 size
+    let retained = after - before - undelivered
+    printfn "delivered %d, retained by server ~%d MiB (raw bound claimed %d MiB)" session.Socket.DeliveredMessages (retained / 1048576L) (18L * int64 limit / 1048576L)
+    gate.SetResult ()
+    Assert.True (retained <= 18L * int64 limit, $"retained %d{retained / 1048576L} MiB")
 }
