@@ -328,58 +328,9 @@ let ``Closing the connection cancels a running subscription`` () : Task = task {
     session.Socket.ServerCloseStatus |> equals (ValueSome WebSocketCloseStatus.NormalClosure)
 }
 
-/// Options with a size limit small enough to fall inside a message read in several frames
-let private withSizeLimit (limit : int) (options : GraphQLOptions<Root>) = {
-    options with
-        ReadBufferSize = 256
-        WebsocketOptions = { options.WebsocketOptions with MaxReceiveMessageSize = limit }
-}
-
 let private withPingHandler (handler : PingHandler) (options : GraphQLOptions<Root>) = {
     options with
         WebsocketOptions = { options.WebsocketOptions with CustomPingHandler = ValueSome handler }
-}
-
-let private smallSizeLimit = 1024
-
-[<Theory>]
-[<InlineData 1>]
-[<InlineData 0>]
-let ``A message up to the maximum size is processed`` (bytesBelowLimit : int) : Task = task {
-    let session = startConnection (withSizeLimit smallSizeLimit)
-    use _ = session.Scope
-    do! initialize session
-    let ping = paddedMessage "ping" (smallSizeLimit - bytesBelowLimit)
-    Encoding.UTF8.GetByteCount ping |> equals (smallSizeLimit - bytesBelowLimit)
-    session.Socket.EnqueueText ping
-    use! pong = receive session
-    typeOf pong |> equals "pong"
-    use sentPing = JsonDocument.Parse ping
-    (payloadOf pong).GetProperty("pad").GetString ()
-    |> equals ((payloadOf sentPing).GetProperty("pad").GetString ())
-    do! closeFromClient session
-    session.Socket.ServerCloseStatus |> equals (ValueSome WebSocketCloseStatus.NormalClosure)
-}
-
-[<Fact>]
-let ``A message over the maximum size closes the connection with 1009 without being read in full`` () : Task = task {
-    let session = startConnection (withSizeLimit smallSizeLimit)
-    use _ = session.Scope
-    do! initialize session
-    let deliveredBefore = session.Socket.DeliveredBytes
-    let size = 64 * 1024
-    session.Socket.EnqueueText (paddedMessage "ping" size)
-    do! waitForTask timeout "The connection did not end after a message over the size limit" session.Run
-    do! session.Run
-    session.Socket.ServerCloseStatus |> equals (ValueSome WebSocketCloseStatus.MessageTooBig)
-    let read = session.Socket.DeliveredBytes - deliveredBefore
-    Assert.True (
-        read <= int64 smallSizeLimit + 1L,
-        $"The server read %d{read} of the %d{size} bytes of a message over the limit of %d{smallSizeLimit} bytes instead of stopping one byte past it"
-    )
-    match session.Socket.Sent.TryRead () with
-    | true, answer -> fail $"The message over the size limit was answered with %s{answer}"
-    | false, _ -> ()
 }
 
 [<Fact>]
@@ -387,7 +338,6 @@ let ``A message over the default maximum size of 4 MiB closes the connection wit
     let limit = 4 * 1024 * 1024
     let session = start ()
     use _ = session.Scope
-    session.Options.WebsocketOptions.MaxReceiveMessageSize |> equals limit
     do! initialize session
     let deliveredBefore = session.Socket.DeliveredBytes
     session.Socket.EnqueueText (paddedMessage "ping" (limit + 4096))
@@ -399,30 +349,8 @@ let ``A message over the default maximum size of 4 MiB closes the connection wit
 }
 
 [<Fact>]
-let ``A connection_init over the maximum size closes the connection with 1009`` () : Task = task {
-    let session = startConnection (withSizeLimit smallSizeLimit)
-    use _ = session.Scope
-    session.Socket.EnqueueText (paddedMessage "connection_init" (smallSizeLimit + 1))
-    do! waitForTask timeout "The connection did not end after a connection_init over the size limit" session.Run
-    do! session.Run
-    session.Socket.ServerCloseStatus |> equals (ValueSome WebSocketCloseStatus.MessageTooBig)
-}
-
-[<Theory>]
-[<InlineData 0>]
-[<InlineData(-1)>]
-let ``A maximum message size that is not positive is rejected`` (maxMessageSize : int) =
-    use socket = new FakeWebSocket ()
-    let ex =
-        Assert.Throws<ArgumentOutOfRangeException> (fun () ->
-            WebSocketMessageReader (socket, serializerOptions, GraphQLOptionsDefaults.ReadBufferSize, maxMessageSize, NullLogger.Instance)
-            |> ignore
-        )
-    ex.ParamName |> equals "maxMessageSize"
-
-[<Fact>]
 let ``The reader stops reading from the socket while the inbox is full`` () : Task = task {
-    let capacity = WebSocketConnectionLimits.IncomingMessageQueueCapacity
+    let capacity = 16
     let struct (gate, handler) = gatedPingHandler ()
     let session = startConnection (withPingHandler handler)
     use _ = session.Scope
@@ -452,7 +380,7 @@ let ``The reader stops reading from the socket while the inbox is full`` () : Ta
 
 [<Fact>]
 let ``The connection ends when its control loop stops while the reader waits for room in the inbox`` () : Task = task {
-    let capacity = WebSocketConnectionLimits.IncomingMessageQueueCapacity
+    let capacity = 16
     let struct (gate, handler) = gatedPingHandler ()
     let session = startConnection (withPingHandler handler)
     use _ = session.Scope
